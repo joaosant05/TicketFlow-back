@@ -72,7 +72,7 @@ Cada alteração realizada em um ticket poderá ser registrada, armazenando info
 ### Instalação
 
 ```bash
-git clone https://github.com/SEU-USUARIO/SEU-REPOSITORIO.git
-cd SEU-REPOSITORIO
+git clone https://github.com/joaosant05/TicketFlow-back
+cd TicketFlow-back
 pip install -r requirements.txt
 uvicorn app.main:app --reload
