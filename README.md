@@ -91,3 +91,28 @@ MYSQL_USER=root
 MYSQL_PASSWORD=Joao1700556#
 MYSQL_DATABASE=ticketflow
 ```
+
+## Docker Compose demonstrativo
+
+Os arquivos Docker foram mantidos para apresentacao da arquitetura do projeto.
+Para desenvolvimento local, continue usando o fluxo normal com `uvicorn` e o
+frontend com Vite.
+
+Na raiz do projeto `TicketFlow`, suba todos os servicos:
+
+```bash
+docker compose up --build
+```
+
+Servicos expostos:
+
+- Frontend: `http://localhost:5173`
+- Backend: `http://localhost:8000`
+- Swagger da API: `http://localhost:8000/docs`
+- MySQL do Docker: `localhost:3307`
+
+O MySQL interno do Compose usa o host `mysql` na rede Docker. Por isso o backend
+usa `MYSQL_HOST=mysql` quando roda em container.
+
+As credenciais no `docker-compose.yml` sao demonstrativas e nao representam a
+senha real do MySQL local.
