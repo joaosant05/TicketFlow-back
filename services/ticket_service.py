@@ -1,12 +1,16 @@
 import logging
 import os
+import base64
+import re
 import unicodedata
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
+from pathlib import Path
 
 from db.connection import db_cursor
 
 
 logger = logging.getLogger("ticketflow.tickets")
+UPLOAD_ROOT = Path("uploads")
 
 INACTIVE_STATUSES = ("Resolvido", "Fechado", "Confirmado")
 
@@ -21,7 +25,7 @@ def _format_sla(deadline):
     if not deadline:
         return None
 
-    remaining_seconds = int((deadline - datetime.now()).total_seconds())
+    remaining_seconds = int((_coerce_datetime(deadline) - datetime.now()).total_seconds())
     if remaining_seconds <= 0:
         return "Expirado"
 
@@ -35,6 +39,59 @@ def _format_sla(deadline):
     return f"{minutes}m"
 
 
+def _coerce_datetime(value):
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).replace(tzinfo=None)
+    return value
+
+
+def calculate_sla(deadline, sla_tipo=None, ticket_id=None):
+    now = datetime.now()
+    deadline_dt = _coerce_datetime(deadline) if deadline else None
+
+    if not deadline_dt:
+        return {
+            "ticketId": ticket_id,
+            "slaTipo": sla_tipo,
+            "slaDeadline": None,
+            "serverNow": now.isoformat(sep=" "),
+            "horas": 0,
+            "minutos": 0,
+            "segundos": 0,
+            "total": 0,
+            "totalSegundos": 0,
+            "expirado": True,
+            "urgencia": "critical",
+            "label": "SLA nao definido",
+        }
+
+    remaining_seconds = int((deadline_dt - now).total_seconds())
+    total = max(remaining_seconds, 0)
+    expired = remaining_seconds <= 0
+    urgency = "critical" if expired or total <= 900 else "warning" if total <= 3600 else "ok"
+    hours = total // 3600
+    minutes = (total % 3600) // 60
+    seconds = total % 60
+    label = "Expirado" if expired else f"{hours:02d}h {minutes:02d}m {seconds:02d}s"
+
+    return {
+        "ticketId": ticket_id,
+        "slaTipo": sla_tipo,
+        "slaDeadline": deadline_dt.isoformat(sep=" "),
+        "serverNow": now.isoformat(sep=" "),
+        "horas": hours,
+        "minutos": minutes,
+        "segundos": seconds,
+        "total": total,
+        "totalSegundos": total,
+        "expirado": expired,
+        "urgencia": urgency,
+        "label": label,
+    }
+
+
 def _format_file_size(size_bytes):
     if size_bytes is None:
         return ""
@@ -43,6 +100,41 @@ def _format_file_size(size_bytes):
     if size_bytes >= 1024:
         return f"{size_bytes / 1024:.0f} KB"
     return f"{size_bytes} B"
+
+
+def _safe_filename(filename):
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", filename or "arquivo")
+    return safe.strip("._") or "arquivo"
+
+
+def _extract_base64_payload(data):
+    raw = data.get("contentBase64") or data.get("dataUrl")
+    if not raw:
+        return None
+    if "," in raw and raw.strip().lower().startswith("data:"):
+        return raw.split(",", 1)[1]
+    return raw
+
+
+def _save_attachment_file(ticket_id, filename, data):
+    payload = _extract_base64_payload(data)
+    if not payload:
+        return data.get("path") or data.get("caminhoArquivo")
+
+    ticket_dir = UPLOAD_ROOT / "tickets" / str(ticket_id)
+    ticket_dir.mkdir(parents=True, exist_ok=True)
+
+    safe_name = _safe_filename(filename)
+    file_path = ticket_dir / safe_name
+    counter = 1
+    while file_path.exists():
+        stem = Path(safe_name).stem
+        suffix = Path(safe_name).suffix
+        file_path = ticket_dir / f"{stem}_{counter}{suffix}"
+        counter += 1
+
+    file_path.write_bytes(base64.b64decode(payload))
+    return "/" + file_path.as_posix()
 
 
 def _normalize_ticket(row):
@@ -150,6 +242,26 @@ def _role_to_db(role):
         "solicitante": "solicitante",
         "tecnico": "tecnico",
     }.get((role or "").strip().lower(), "solicitante")
+
+
+def _validate_opening_data(data):
+    missing_fields = []
+
+    if not data.get("titulo") or len(data["titulo"].strip()) < 3:
+        missing_fields.append("titulo")
+    if not data.get("descricao") or len(data["descricao"].strip()) < 5:
+        missing_fields.append("descricao")
+    if not (data.get("idCategoria") or data.get("categoriaId") or data.get("prioridade")):
+        missing_fields.append("categoria/prioridade")
+
+    if missing_fields:
+        logger.info(
+            "   [RN1] Validacao dos campos obrigatorios: FALHOU | campos=%s",
+            ", ".join(missing_fields),
+        )
+        raise ValueError(f"Dados incompletos: {', '.join(missing_fields)}")
+
+    logger.info("   [RN1] Validacao dos campos obrigatorios: OK")
 
 
 def _insert_history(
@@ -286,7 +398,7 @@ def get_ticket(ticket_id):
 
         cursor.execute(
             """
-            SELECT nome_arquivo, tamanho_bytes, tipo_arquivo
+            SELECT nome_arquivo, caminho_arquivo, tamanho_bytes, tipo_arquivo
             FROM ticket_anexos
             WHERE ticket_id = %s
             ORDER BY criado_em ASC
@@ -296,6 +408,8 @@ def get_ticket(ticket_id):
         ticket["anexos"] = [
             {
                 "name": row["nome_arquivo"],
+                "url": row["caminho_arquivo"],
+                "path": row["caminho_arquivo"],
                 "size": _format_file_size(row["tamanho_bytes"]),
                 "type": row["tipo_arquivo"],
             }
@@ -317,6 +431,28 @@ def get_ticket(ticket_id):
         ticket["history"] = [_normalize_history(row) for row in cursor.fetchall()]
 
         return ticket
+
+
+def get_ticket_sla(ticket_id):
+    with db_cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT id, sla_tipo, sla_deadline
+            FROM tickets
+            WHERE id = %s
+            """,
+            (ticket_id,),
+        )
+        ticket = cursor.fetchone()
+
+    if not ticket:
+        return None
+
+    return calculate_sla(
+        deadline=ticket.get("sla_deadline"),
+        sla_tipo=ticket.get("sla_tipo"),
+        ticket_id=ticket["id"],
+    )
 
 
 def _normalize_history(row):
@@ -342,6 +478,9 @@ def _normalize_history(row):
 
 
 def create_ticket(data):
+    logger.info("   TicketService: processando abertura")
+    _validate_opening_data(data)
+
     current_year = date.today().year
     category_id = _resolve_category_id(data)
 
@@ -376,6 +515,7 @@ def create_ticket(data):
         )
         categoria = cursor.fetchone()
         if not categoria:
+            logger.info("   [RN1] Categoria nao encontrada | categoria_id=%s", category_id)
             raise ValueError("Categoria nao encontrada")
 
         departamento_id = (
@@ -383,45 +523,89 @@ def create_ticket(data):
             or _find_department_id(cursor, data.get("departamento"))
             or categoria["departamento_padrao_id"]
         )
-        sla_horas = categoria["sla_horas"]
+        if not departamento_id:
+            logger.info("   [RoteamentoAutomatico] Departamento tecnico nao encontrado")
+            raise ValueError("Departamento tecnico nao encontrado")
 
+        sla_horas = categoria["sla_horas"]
+        data_atual = datetime.now()
+        prazo_maximo = data_atual + timedelta(hours=sla_horas)
+
+        logger.info(
+            "3. TicketService -> MotorSLA | calcularPrazo(DataAtual=%s, Categoria=%s)",
+            data_atual.strftime("%Y-%m-%d %H:%M:%S"),
+            category_id,
+        )
+        logger.info(
+            "   MotorSLA -> TicketService | DataPrazoMaximo=%s",
+            prazo_maximo.strftime("%Y-%m-%d %H:%M:%S"),
+        )
+        logger.info(
+            "4. TicketService -> RoteamentoAutomatico | alocarFila(Categoria=%s)",
+            category_id,
+        )
+        logger.info(
+            "   RoteamentoAutomatico -> TicketService | idFilaTecnica=%s",
+            departamento_id,
+        )
+
+        logger.info("5. TicketService -> TicketRepository | salvar(Ticket)")
         cursor.execute(
             """
             INSERT INTO tickets (
               protocolo, ano, titulo, descricao, categoria_id, solicitante_id,
               departamento_id, sla_deadline
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, DATE_ADD(NOW(), INTERVAL %s HOUR))
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (
                 protocolo,
                 current_year,
-                data["titulo"],
-                data["descricao"],
+                data["titulo"].strip(),
+                data["descricao"].strip(),
                 category_id,
                 solicitante_id,
                 departamento_id,
-                sla_horas,
+                prazo_maximo,
             ),
         )
         ticket_id = cursor.lastrowid
+        logger.info(
+            "   TicketRepository -> TicketService | Ticket Salvo | id=%s | protocolo=%s/%s",
+            ticket_id,
+            protocolo,
+            current_year,
+        )
+
+        logger.info('6. TicketService -> AuditoriaService | salvarRegistro("Criacao de Ticket")')
         _insert_history(
             cursor,
             ticket_id=ticket_id,
             tipo="created",
             titulo="Ticket criado",
-            descricao=data["descricao"],
+            descricao=data["descricao"].strip(),
             ator_id=solicitante_id,
         )
+        logger.info("   AuditoriaService -> TicketService | Registro salvo")
 
     logger.info(
-        "ticket.created | ticket_id=%s | protocolo=%s/%s | solicitante=%s | departamento_id=%s | categoria_id=%s",
+        "7. TicketService -> TicketController | Ticket Processado | id=%s | protocolo=%s/%s",
         ticket_id,
         protocolo,
         current_year,
+    )
+    logger.info(
+        "8. Resumo | solicitante=%s | departamento_id=%s | categoria_id=%s | sla_deadline=%s",
         data.get("solicitanteEmail") or solicitante_id or "anonimo",
         departamento_id,
         category_id,
+        prazo_maximo.strftime("%Y-%m-%d %H:%M:%S"),
+    )
+    logger.info(
+        "   Banco | ticket_id=%s | protocolo=%s/%s",
+        ticket_id,
+        protocolo,
+        current_year,
     )
     return get_ticket(ticket_id)
 
@@ -453,7 +637,7 @@ def update_status(ticket_id, status, actor_email=None, note=None):
         )
 
     logger.info(
-        "ticket.status_updated | ticket_id=%s | actor=%s | from=%s | to=%s",
+        "ACAO: status atualizado | ticket=%s | ator=%s | %s -> %s",
         ticket_id,
         actor_email or "anonimo",
         old_status,
@@ -498,7 +682,7 @@ def assign_ticket(
         )
 
     logger.info(
-        "ticket.assigned | ticket_id=%s | actor=%s | responsavel_id=%s | responsavel_email=%s",
+        "ACAO: ticket atribuido | ticket=%s | ator=%s | responsavel_id=%s | email=%s",
         ticket_id,
         actor_email or "anonimo",
         responsavel_id,
@@ -536,7 +720,7 @@ def transfer_department(ticket_id, departamento_id=None, departamento=None, acto
         )
 
     logger.info(
-        "ticket.department_transferred | ticket_id=%s | actor=%s | from=%s | to=%s",
+        "ACAO: departamento transferido | ticket=%s | ator=%s | %s -> %s",
         ticket_id,
         actor_email or "anonimo",
         old_department_id,
@@ -594,7 +778,7 @@ def add_public_reply(ticket_id, data):
             )
 
     logger.info(
-        "ticket.reply_added | ticket_id=%s | actor=%s | status_after=%s",
+        "ACAO: resposta registrada | ticket=%s | ator=%s | novo_status=%s",
         ticket_id,
         data.get("actorEmail") or "anonimo",
         status_after or "-",
@@ -629,7 +813,7 @@ def add_internal_note(ticket_id, data):
         )
 
     logger.info(
-        "ticket.internal_note_added | ticket_id=%s | actor=%s",
+        "ACAO: nota interna registrada | ticket=%s | ator=%s",
         ticket_id,
         data.get("actorEmail") or "anonimo",
     )
@@ -645,6 +829,9 @@ def add_attachment(ticket_id, data):
         name = data.get("name") or data.get("nomeArquivo") or data.get("filename")
         if not name:
             raise ValueError("Nome do anexo nao informado")
+
+        stored_path = _save_attachment_file(ticket_id, name, data)
+        file_type = data.get("type") or data.get("tipoArquivo") or data.get("mimeType")
 
         actor_id = _get_or_create_user(
             cursor,
@@ -662,9 +849,9 @@ def add_attachment(ticket_id, data):
             (
                 ticket_id,
                 name,
-                data.get("path") or data.get("caminhoArquivo"),
+                stored_path,
                 data.get("sizeBytes") or data.get("tamanhoBytes"),
-                data.get("type") or data.get("tipoArquivo"),
+                file_type,
                 actor_id,
             ),
         )
@@ -678,7 +865,7 @@ def add_attachment(ticket_id, data):
         )
 
     logger.info(
-        "ticket.attachment_added | ticket_id=%s | actor=%s | file=%s",
+        "ACAO: anexo registrado | ticket=%s | ator=%s | arquivo=%s",
         ticket_id,
         data.get("actorEmail") or "anonimo",
         name,

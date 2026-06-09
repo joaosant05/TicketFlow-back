@@ -1,3 +1,4 @@
+import logging
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query, status
@@ -7,11 +8,12 @@ from services import ticket_service
 
 
 router = APIRouter(prefix="/api", tags=["tickets"])
+logger = logging.getLogger("ticketflow.controller")
 
 
 class TicketCreate(BaseModel):
-    titulo: str = Field(min_length=3, max_length=180)
-    descricao: str = Field(min_length=5)
+    titulo: Optional[str] = None
+    descricao: Optional[str] = None
     idCategoria: Optional[int] = None
     categoriaId: Optional[int] = None
     solicitanteId: Optional[int] = None
@@ -70,6 +72,9 @@ class AttachmentCreate(BaseModel):
     caminhoArquivo: Optional[str] = Field(default=None, max_length=500)
     sizeBytes: Optional[int] = Field(default=None, ge=0)
     tamanhoBytes: Optional[int] = Field(default=None, ge=0)
+    contentBase64: Optional[str] = None
+    dataUrl: Optional[str] = None
+    mimeType: Optional[str] = Field(default=None, max_length=120)
     actorEmail: Optional[str] = None
     actorName: Optional[str] = None
 
@@ -104,11 +109,42 @@ def get_ticket(ticket_id: int):
     return ticket
 
 
+@router.get("/tickets/{ticket_id}/sla")
+def get_ticket_sla(ticket_id: int):
+    sla = ticket_service.get_ticket_sla(ticket_id)
+    if not sla:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Ticket nao encontrado",
+        )
+    return sla
+
+
 @router.post("/tickets", status_code=status.HTTP_201_CREATED)
 def create_ticket(payload: TicketCreate):
+    logger.info("")
+    logger.info("============================================================")
+    logger.info("FLUXO: ABERTURA DE TICKET")
+    logger.info("Ator: %s", payload.solicitanteEmail or "usuario nao informado")
+    logger.info("1. Interface Web -> TicketController | POST /api/tickets")
+    logger.info("2. TicketController -> TicketService | processarAbertura(FormDTO)")
     try:
-        return ticket_service.create_ticket(payload.dict(exclude_none=True))
+        ticket = ticket_service.create_ticket(payload.dict(exclude_none=True))
+        logger.info(
+            "9. TicketController -> Interface Web | Response 201 | Protocolo %s/%s",
+            ticket["protocolo"],
+            ticket["ano"],
+        )
+        logger.info("FIM DO FLUXO: ticket criado com sucesso")
+        logger.info("============================================================")
+        logger.info("")
+        return ticket
     except ValueError as exc:
+        logger.info("3. TicketService -> TicketController | Erro de validacao")
+        logger.info("4. TicketController -> Interface Web | Response 400 | %s", exc)
+        logger.info("FIM DO FLUXO: abertura recusada")
+        logger.info("============================================================")
+        logger.info("")
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
