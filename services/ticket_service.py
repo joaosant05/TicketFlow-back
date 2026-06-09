@@ -1,10 +1,20 @@
+import logging
 import os
+import unicodedata
 from datetime import date, datetime
 
 from db.connection import db_cursor
 
 
+logger = logging.getLogger("ticketflow.tickets")
+
 INACTIVE_STATUSES = ("Resolvido", "Fechado", "Confirmado")
+
+DEFAULT_CATEGORY_BY_PRIORITY = {
+    "alta": 2,
+    "media": 4,
+    "baixa": 5,
+}
 
 
 def _format_sla(deadline):
@@ -64,6 +74,82 @@ def _find_user_id(cursor, email=None):
     cursor.execute("SELECT id FROM usuarios WHERE email = %s LIMIT 1", (email,))
     user = cursor.fetchone()
     return user["id"] if user else None
+
+
+def _get_or_create_user(cursor, email=None, name=None, papel="solicitante"):
+    user_id = _find_user_id(cursor, email)
+    if user_id or not email:
+        return user_id
+
+    display_name = name or email.split("@", 1)[0].replace(".", " ").title()
+    cursor.execute(
+        """
+        INSERT INTO usuarios (nome, email, papel)
+        VALUES (%s, %s, %s)
+        """,
+        (display_name, email, papel),
+    )
+    return cursor.lastrowid
+
+
+def _find_department_id(cursor, department):
+    if not department:
+        return None
+
+    normalized = department.replace("_", " ").strip().lower()
+    aliases = {
+        "suporte n1": "Suporte N1",
+        "infraestrutura": "Infraestrutura",
+        "financeiro": "Financeiro",
+        "produto": "Produto",
+        "rh": "RH",
+    }
+    department_name = aliases.get(normalized, department)
+
+    cursor.execute(
+        """
+        SELECT id
+        FROM departamentos
+        WHERE LOWER(nome) = LOWER(%s)
+        LIMIT 1
+        """,
+        (department_name,),
+    )
+    row = cursor.fetchone()
+    return row["id"] if row else None
+
+
+def _resolve_category_id(data):
+    category_id = data.get("idCategoria") or data.get("categoriaId")
+    if category_id:
+        return category_id
+
+    priority = _normalize_key(data.get("prioridade") or "")
+    return DEFAULT_CATEGORY_BY_PRIORITY.get(priority, 5)
+
+
+def _normalize_key(value):
+    normalized = unicodedata.normalize("NFKD", str(value))
+    ascii_value = normalized.encode("ascii", "ignore").decode("ascii")
+    return ascii_value.strip().lower()
+
+
+def _first_text(data, *keys):
+    for key in keys:
+        value = data.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _role_to_db(role):
+    return {
+        "user": "solicitante",
+        "tech": "tecnico",
+        "admin": "admin",
+        "solicitante": "solicitante",
+        "tecnico": "tecnico",
+    }.get((role or "").strip().lower(), "solicitante")
 
 
 def _insert_history(
@@ -146,6 +232,30 @@ def list_tickets(queue="department", current_user=None):
             ORDER BY t.criado_em DESC
             """,
             tuple(params),
+        )
+        return [_normalize_ticket(row) for row in cursor.fetchall()]
+
+
+def list_user_tickets(current_user):
+    with db_cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT
+              t.id, t.protocolo, t.ano, t.titulo, t.descricao, t.status,
+              t.categoria_id, t.sla_tipo, t.sla_deadline, t.criado_em,
+              c.prioridade,
+              responsavel.nome AS responsavel,
+              solicitante.nome AS solicitante,
+              d.nome AS departamento
+            FROM tickets t
+            INNER JOIN categorias c ON c.id = t.categoria_id
+            LEFT JOIN usuarios responsavel ON responsavel.id = t.responsavel_id
+            LEFT JOIN usuarios solicitante ON solicitante.id = t.solicitante_id
+            LEFT JOIN departamentos d ON d.id = t.departamento_id
+            WHERE solicitante.email = %s OR solicitante.nome = %s
+            ORDER BY t.criado_em DESC
+            """,
+            (current_user, current_user),
         )
         return [_normalize_ticket(row) for row in cursor.fetchall()]
 
@@ -233,6 +343,7 @@ def _normalize_history(row):
 
 def create_ticket(data):
     current_year = date.today().year
+    category_id = _resolve_category_id(data)
 
     with db_cursor(commit=True) as cursor:
         cursor.execute(
@@ -248,7 +359,12 @@ def create_ticket(data):
 
         solicitante_id = data.get("solicitanteId")
         if not solicitante_id:
-            solicitante_id = _find_user_id(cursor, data.get("solicitanteEmail"))
+            solicitante_id = _get_or_create_user(
+                cursor,
+                email=data.get("solicitanteEmail"),
+                name=data.get("solicitanteNome"),
+                papel="solicitante",
+            )
 
         cursor.execute(
             """
@@ -256,11 +372,17 @@ def create_ticket(data):
             FROM categorias
             WHERE id = %s
             """,
-            (data["idCategoria"],),
+            (category_id,),
         )
         categoria = cursor.fetchone()
+        if not categoria:
+            raise ValueError("Categoria nao encontrada")
 
-        departamento_id = data.get("departamentoId") or categoria["departamento_padrao_id"]
+        departamento_id = (
+            data.get("departamentoId")
+            or _find_department_id(cursor, data.get("departamento"))
+            or categoria["departamento_padrao_id"]
+        )
         sla_horas = categoria["sla_horas"]
 
         cursor.execute(
@@ -276,7 +398,7 @@ def create_ticket(data):
                 current_year,
                 data["titulo"],
                 data["descricao"],
-                data["idCategoria"],
+                category_id,
                 solicitante_id,
                 departamento_id,
                 sla_horas,
@@ -292,6 +414,15 @@ def create_ticket(data):
             ator_id=solicitante_id,
         )
 
+    logger.info(
+        "ticket.created | ticket_id=%s | protocolo=%s/%s | solicitante=%s | departamento_id=%s | categoria_id=%s",
+        ticket_id,
+        protocolo,
+        current_year,
+        data.get("solicitanteEmail") or solicitante_id or "anonimo",
+        departamento_id,
+        category_id,
+    )
     return get_ticket(ticket_id)
 
 
@@ -321,16 +452,39 @@ def update_status(ticket_id, status, actor_email=None, note=None):
             status_para=status,
         )
 
+    logger.info(
+        "ticket.status_updated | ticket_id=%s | actor=%s | from=%s | to=%s",
+        ticket_id,
+        actor_email or "anonimo",
+        old_status,
+        status,
+    )
     return get_ticket(ticket_id)
 
 
-def assign_ticket(ticket_id, responsavel_id, actor_email=None):
+def assign_ticket(
+    ticket_id,
+    responsavel_id=None,
+    responsavel_email=None,
+    responsavel_nome=None,
+    actor_email=None,
+):
     with db_cursor(commit=True) as cursor:
         cursor.execute("SELECT id FROM tickets WHERE id = %s", (ticket_id,))
         if not cursor.fetchone():
             return None
 
-        actor_id = _find_user_id(cursor, actor_email)
+        if not responsavel_id:
+            responsavel_id = _get_or_create_user(
+                cursor,
+                email=responsavel_email,
+                name=responsavel_nome,
+                papel="tecnico",
+            )
+        if not responsavel_id:
+            raise ValueError("Responsavel nao informado")
+
+        actor_id = _get_or_create_user(cursor, email=actor_email)
         cursor.execute(
             "UPDATE tickets SET responsavel_id = %s WHERE id = %s",
             (responsavel_id, ticket_id),
@@ -343,18 +497,29 @@ def assign_ticket(ticket_id, responsavel_id, actor_email=None):
             ator_id=actor_id,
         )
 
+    logger.info(
+        "ticket.assigned | ticket_id=%s | actor=%s | responsavel_id=%s | responsavel_email=%s",
+        ticket_id,
+        actor_email or "anonimo",
+        responsavel_id,
+        responsavel_email or "-",
+    )
     return get_ticket(ticket_id)
 
 
-def transfer_department(ticket_id, departamento_id, actor_email=None):
+def transfer_department(ticket_id, departamento_id=None, departamento=None, actor_email=None):
     with db_cursor(commit=True) as cursor:
         cursor.execute("SELECT departamento_id FROM tickets WHERE id = %s", (ticket_id,))
         ticket = cursor.fetchone()
         if not ticket:
             return None
 
+        departamento_id = departamento_id or _find_department_id(cursor, departamento)
+        if not departamento_id:
+            raise ValueError("Departamento nao encontrado")
+
         old_department_id = ticket["departamento_id"]
-        actor_id = _find_user_id(cursor, actor_email)
+        actor_id = _get_or_create_user(cursor, email=actor_email)
 
         cursor.execute(
             "UPDATE tickets SET departamento_id = %s WHERE id = %s",
@@ -370,17 +535,33 @@ def transfer_department(ticket_id, departamento_id, actor_email=None):
             departamento_para_id=departamento_id,
         )
 
+    logger.info(
+        "ticket.department_transferred | ticket_id=%s | actor=%s | from=%s | to=%s",
+        ticket_id,
+        actor_email or "anonimo",
+        old_department_id,
+        departamento_id,
+    )
     return get_ticket(ticket_id)
 
 
-def add_public_reply(ticket_id, mensagem, actor_email=None, resolver=False):
+def add_public_reply(ticket_id, data):
+    mensagem = _first_text(data, "mensagem", "resposta", "comentario")
+    if not mensagem:
+        raise ValueError("Mensagem nao informada")
+
     with db_cursor(commit=True) as cursor:
         cursor.execute("SELECT status FROM tickets WHERE id = %s", (ticket_id,))
         ticket = cursor.fetchone()
         if not ticket:
             return None
 
-        actor_id = _find_user_id(cursor, actor_email)
+        actor_id = _get_or_create_user(
+            cursor,
+            email=data.get("actorEmail"),
+            name=data.get("actorName"),
+            papel=_role_to_db(data.get("actorRole")),
+        )
         _insert_history(
             cursor,
             ticket_id=ticket_id,
@@ -391,32 +572,52 @@ def add_public_reply(ticket_id, mensagem, actor_email=None, resolver=False):
             publico=True,
         )
 
-        if resolver:
+        status_after = data.get("statusAfter")
+        if data.get("resolver"):
+            status_after = "Resolvido"
+
+        if status_after:
+            closed_at_sql = ", fechado_em = NOW()" if status_after in INACTIVE_STATUSES else ""
             cursor.execute(
-                "UPDATE tickets SET status = %s, fechado_em = NOW() WHERE id = %s",
-                ("Resolvido", ticket_id),
+                f"UPDATE tickets SET status = %s {closed_at_sql} WHERE id = %s",
+                (status_after, ticket_id),
             )
             _insert_history(
                 cursor,
                 ticket_id=ticket_id,
                 tipo="status",
                 titulo="Status alterado",
-                descricao="Solucao enviada aguardando validacao do cliente.",
+                descricao="Status atualizado apos comentario.",
                 ator_id=actor_id,
                 status_de=ticket["status"],
-                status_para="Resolvido",
+                status_para=status_after,
             )
 
+    logger.info(
+        "ticket.reply_added | ticket_id=%s | actor=%s | status_after=%s",
+        ticket_id,
+        data.get("actorEmail") or "anonimo",
+        status_after or "-",
+    )
     return get_ticket(ticket_id)
 
 
-def add_internal_note(ticket_id, nota, actor_email=None):
+def add_internal_note(ticket_id, data):
+    nota = _first_text(data, "nota", "mensagem", "comentario")
+    if not nota:
+        raise ValueError("Nota nao informada")
+
     with db_cursor(commit=True) as cursor:
         cursor.execute("SELECT id FROM tickets WHERE id = %s", (ticket_id,))
         if not cursor.fetchone():
             return None
 
-        actor_id = _find_user_id(cursor, actor_email)
+        actor_id = _get_or_create_user(
+            cursor,
+            email=data.get("actorEmail"),
+            name=data.get("actorName"),
+            papel="tecnico",
+        )
         _insert_history(
             cursor,
             ticket_id=ticket_id,
@@ -427,6 +628,11 @@ def add_internal_note(ticket_id, nota, actor_email=None):
             publico=False,
         )
 
+    logger.info(
+        "ticket.internal_note_added | ticket_id=%s | actor=%s",
+        ticket_id,
+        data.get("actorEmail") or "anonimo",
+    )
     return get_ticket(ticket_id)
 
 
@@ -436,7 +642,15 @@ def add_attachment(ticket_id, data):
         if not cursor.fetchone():
             return None
 
-        actor_id = _find_user_id(cursor, data.get("actorEmail"))
+        name = data.get("name") or data.get("nomeArquivo") or data.get("filename")
+        if not name:
+            raise ValueError("Nome do anexo nao informado")
+
+        actor_id = _get_or_create_user(
+            cursor,
+            email=data.get("actorEmail"),
+            name=data.get("actorName"),
+        )
         cursor.execute(
             """
             INSERT INTO ticket_anexos (
@@ -447,10 +661,10 @@ def add_attachment(ticket_id, data):
             """,
             (
                 ticket_id,
-                data["name"],
-                data.get("path"),
-                data.get("sizeBytes"),
-                data.get("type"),
+                name,
+                data.get("path") or data.get("caminhoArquivo"),
+                data.get("sizeBytes") or data.get("tamanhoBytes"),
+                data.get("type") or data.get("tipoArquivo"),
                 actor_id,
             ),
         )
@@ -459,10 +673,16 @@ def add_attachment(ticket_id, data):
             ticket_id=ticket_id,
             tipo="attachment",
             titulo="Anexo adicionado",
-            descricao=f"Arquivo anexado: {data['name']}",
+            descricao=f"Arquivo anexado: {name}",
             ator_id=actor_id,
         )
 
+    logger.info(
+        "ticket.attachment_added | ticket_id=%s | actor=%s | file=%s",
+        ticket_id,
+        data.get("actorEmail") or "anonimo",
+        name,
+    )
     return get_ticket(ticket_id)
 
 

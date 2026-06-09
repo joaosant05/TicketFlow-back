@@ -122,7 +122,8 @@ INSERT IGNORE INTO departamentos (id, nome) VALUES
   (1, 'Financeiro'),
   (2, 'Produto'),
   (3, 'Suporte N1'),
-  (4, 'Infraestrutura');
+  (4, 'Infraestrutura'),
+  (5, 'RH');
 
 INSERT IGNORE INTO categorias (id, nome, prioridade, sla_horas, departamento_padrao_id) VALUES
   (1, 'Incidente Critico', 'Alta', 4, 4),
@@ -132,3 +133,14 @@ INSERT IGNORE INTO categorias (id, nome, prioridade, sla_horas, departamento_pad
   (5, 'Duvida ou Solicitacao', 'Baixa', 72, 3),
   (6, 'Acesso', 'Baixa', 24, 3),
   (7, 'Documentacao', 'Baixa', 72, 2);
+
+INSERT IGNORE INTO usuarios (id, nome, email, papel, departamento_id) VALUES
+  (1, 'Maria Silva', 'maria.silva@empresa.com.br', 'solicitante', 1),
+  (2, 'Carlos Mendes', 'carlos.mendes@empresa.com.br', 'tecnico', 1),
+  (3, 'Joao Santos', 'joao.santos@empresa.com.br', 'tecnico', 4),
+  (4, 'Ana Costa', 'ana.costa@empresa.com.br', 'tecnico', 4),
+  (5, 'Pedro Lima', 'pedro.lima@empresa.com.br', 'solicitante', 2),
+  (6, 'Fernanda Rocha', 'fernanda.rocha@empresa.com.br', 'solicitante', 2),
+  (7, 'Lucas Oliveira', 'lucas.oliveira@empresa.com.br', 'tecnico', 2),
+  (8, 'Beatriz Nunes', 'beatriz.nunes@empresa.com.br', 'solicitante', 5),
+  (9, 'Rafael Moura', 'rafael.moura@empresa.com.br', 'admin', 5);

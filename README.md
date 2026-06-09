@@ -75,4 +75,19 @@ Cada alteração realizada em um ticket poderá ser registrada, armazenando info
 git clone https://github.com/joaosant05/TicketFlow-back
 cd TicketFlow-back
 pip install -r requirements.txt
-uvicorn app.main:app --reload
+uvicorn main:app --reload
+```
+
+Ao iniciar, a API executa `db/schema.sql` automaticamente. Se o banco `ticketflow`
+ainda nao existir no MySQL local, ele sera criado com `CREATE DATABASE IF NOT EXISTS`
+e as tabelas serao criadas com `CREATE TABLE IF NOT EXISTS`.
+
+Configuracao padrao de banco:
+
+```bash
+MYSQL_HOST=localhost
+MYSQL_PORT=3306
+MYSQL_USER=root
+MYSQL_PASSWORD=Joao1700556#
+MYSQL_DATABASE=ticketflow
+```

@@ -12,10 +12,14 @@ router = APIRouter(prefix="/api", tags=["tickets"])
 class TicketCreate(BaseModel):
     titulo: str = Field(min_length=3, max_length=180)
     descricao: str = Field(min_length=5)
-    idCategoria: int
+    idCategoria: Optional[int] = None
+    categoriaId: Optional[int] = None
     solicitanteId: Optional[int] = None
     solicitanteEmail: Optional[str] = None
+    solicitanteNome: Optional[str] = None
     departamentoId: Optional[int] = None
+    departamento: Optional[str] = None
+    prioridade: Optional[str] = None
 
 
 class StatusUpdate(BaseModel):
@@ -25,32 +29,49 @@ class StatusUpdate(BaseModel):
 
 
 class AssignTicket(BaseModel):
-    responsavelId: int
+    responsavelId: Optional[int] = None
+    responsavelEmail: Optional[str] = None
+    responsavelNome: Optional[str] = None
     actorEmail: Optional[str] = None
 
 
 class DepartmentTransfer(BaseModel):
-    departamentoId: int
+    departamentoId: Optional[int] = None
+    departamento: Optional[str] = None
     actorEmail: Optional[str] = None
 
 
 class PublicReply(BaseModel):
-    mensagem: str = Field(min_length=1, max_length=2000)
+    mensagem: Optional[str] = Field(default=None, max_length=2000)
+    resposta: Optional[str] = Field(default=None, max_length=2000)
+    comentario: Optional[str] = Field(default=None, max_length=2000)
     actorEmail: Optional[str] = None
+    actorName: Optional[str] = None
+    actorRole: Optional[str] = None
     resolver: bool = False
+    statusAfter: Optional[str] = None
 
 
 class InternalNote(BaseModel):
-    nota: str = Field(min_length=1, max_length=1000)
+    nota: Optional[str] = Field(default=None, max_length=1000)
+    mensagem: Optional[str] = Field(default=None, max_length=1000)
+    comentario: Optional[str] = Field(default=None, max_length=1000)
     actorEmail: Optional[str] = None
+    actorName: Optional[str] = None
 
 
 class AttachmentCreate(BaseModel):
-    name: str = Field(min_length=1, max_length=255)
+    name: Optional[str] = Field(default=None, max_length=255)
+    nomeArquivo: Optional[str] = Field(default=None, max_length=255)
+    filename: Optional[str] = Field(default=None, max_length=255)
     type: Optional[str] = Field(default=None, max_length=40)
+    tipoArquivo: Optional[str] = Field(default=None, max_length=40)
     path: Optional[str] = Field(default=None, max_length=500)
+    caminhoArquivo: Optional[str] = Field(default=None, max_length=500)
     sizeBytes: Optional[int] = Field(default=None, ge=0)
+    tamanhoBytes: Optional[int] = Field(default=None, ge=0)
     actorEmail: Optional[str] = None
+    actorName: Optional[str] = None
 
 
 @router.get("/tickets")
@@ -59,6 +80,17 @@ def list_tickets(
     currentUser: Optional[str] = Query(default=None),
 ):
     return ticket_service.list_tickets(queue=queue, current_user=currentUser)
+
+
+@router.get("/meus-chamados")
+def list_my_requests(
+    currentUser: Optional[str] = Query(default=None),
+    email: Optional[str] = Query(default=None),
+):
+    current_user = currentUser or email
+    if not current_user:
+        raise HTTPException(status_code=400, detail="Informe currentUser ou email")
+    return ticket_service.list_user_tickets(current_user=current_user)
 
 
 @router.get("/tickets/{ticket_id}")
@@ -74,7 +106,10 @@ def get_ticket(ticket_id: int):
 
 @router.post("/tickets", status_code=status.HTTP_201_CREATED)
 def create_ticket(payload: TicketCreate):
-    return ticket_service.create_ticket(payload.dict(exclude_none=True))
+    try:
+        return ticket_service.create_ticket(payload.dict(exclude_none=True))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.patch("/tickets/{ticket_id}/status")
@@ -92,11 +127,16 @@ def update_status(ticket_id: int, payload: StatusUpdate):
 
 @router.patch("/tickets/{ticket_id}/responsavel")
 def assign_ticket(ticket_id: int, payload: AssignTicket):
-    ticket = ticket_service.assign_ticket(
-        ticket_id=ticket_id,
-        responsavel_id=payload.responsavelId,
-        actor_email=payload.actorEmail,
-    )
+    try:
+        ticket = ticket_service.assign_ticket(
+            ticket_id=ticket_id,
+            responsavel_id=payload.responsavelId,
+            responsavel_email=payload.responsavelEmail,
+            responsavel_nome=payload.responsavelNome,
+            actor_email=payload.actorEmail,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not ticket:
         raise HTTPException(status_code=404, detail="Ticket nao encontrado")
     return ticket
@@ -104,11 +144,15 @@ def assign_ticket(ticket_id: int, payload: AssignTicket):
 
 @router.patch("/tickets/{ticket_id}/departamento")
 def transfer_department(ticket_id: int, payload: DepartmentTransfer):
-    ticket = ticket_service.transfer_department(
-        ticket_id=ticket_id,
-        departamento_id=payload.departamentoId,
-        actor_email=payload.actorEmail,
-    )
+    try:
+        ticket = ticket_service.transfer_department(
+            ticket_id=ticket_id,
+            departamento_id=payload.departamentoId,
+            departamento=payload.departamento,
+            actor_email=payload.actorEmail,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not ticket:
         raise HTTPException(status_code=404, detail="Ticket nao encontrado")
     return ticket
@@ -116,24 +160,34 @@ def transfer_department(ticket_id: int, payload: DepartmentTransfer):
 
 @router.post("/tickets/{ticket_id}/respostas")
 def add_public_reply(ticket_id: int, payload: PublicReply):
-    ticket = ticket_service.add_public_reply(
-        ticket_id=ticket_id,
-        mensagem=payload.mensagem,
-        actor_email=payload.actorEmail,
-        resolver=payload.resolver,
-    )
+    data = payload.dict(exclude_none=True)
+    try:
+        ticket = ticket_service.add_public_reply(
+            ticket_id=ticket_id,
+            data=data,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not ticket:
         raise HTTPException(status_code=404, detail="Ticket nao encontrado")
     return ticket
 
 
+@router.post("/tickets/{ticket_id}/comentarios")
+def add_comment(ticket_id: int, payload: PublicReply):
+    return add_public_reply(ticket_id, payload)
+
+
 @router.post("/tickets/{ticket_id}/notas")
 def add_internal_note(ticket_id: int, payload: InternalNote):
-    ticket = ticket_service.add_internal_note(
-        ticket_id=ticket_id,
-        nota=payload.nota,
-        actor_email=payload.actorEmail,
-    )
+    data = payload.dict(exclude_none=True)
+    try:
+        ticket = ticket_service.add_internal_note(
+            ticket_id=ticket_id,
+            data=data,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not ticket:
         raise HTTPException(status_code=404, detail="Ticket nao encontrado")
     return ticket
@@ -141,10 +195,13 @@ def add_internal_note(ticket_id: int, payload: InternalNote):
 
 @router.post("/tickets/{ticket_id}/anexos")
 def add_attachment(ticket_id: int, payload: AttachmentCreate):
-    ticket = ticket_service.add_attachment(
-        ticket_id=ticket_id,
-        data=payload.dict(exclude_none=True),
-    )
+    try:
+        ticket = ticket_service.add_attachment(
+            ticket_id=ticket_id,
+            data=payload.dict(exclude_none=True),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not ticket:
         raise HTTPException(status_code=404, detail="Ticket nao encontrado")
     return ticket
